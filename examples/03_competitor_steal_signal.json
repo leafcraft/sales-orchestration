@@ -1,0 +1,15 @@
+{
+  "_entry_point": "manual_action",
+  "_description": "Competitor intel flags a customer evaluating an alternative \u2014 sales-ops accelerates the renewal play.",
+  "payload": {
+    "source": "competitor_signal",
+    "email": "champion@northwave.example",
+    "company": "Northwave Logistics",
+    "job_title": "CTO",
+    "intent_signal": "competitor_evaluation",
+    "competitor_name": "Acme Mesh Alternative",
+    "renewal_window_days": 45,
+    "deal_value_arr_cents": 12400000,
+    "trigger_event": "champion downloaded competitor's RFP template"
+  }
+}

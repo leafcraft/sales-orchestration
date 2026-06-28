@@ -1,0 +1,21 @@
+{
+  "scenario": "Inbound demo request — full enrichment chain",
+  "entry_point": "webform_lead",
+  "expected_flow": [
+    "lead_intake_agent → normalises + pulls firmographics + funding + tech stack + DMs",
+    "lead_qualification_agent → scores with enriched context + drafts opener citing specific signals",
+    "→ its tier × intent wires route directly: hot tier → ae_human (cadences live in your MAP/sequencer, e.g. Outreach/Salesloft)"
+  ],
+  "payload": {
+    "source": "webform",
+    "email": "head.of.platform@acme-finance.com",
+    "company_domain": "acme-finance.com",
+    "job_title": "Head of Platform Engineering",
+    "intent_signal": "downloaded the 'multi-agent ROI' guide twice in 48h",
+    "form_fields": {
+      "company_size_range": "200-500",
+      "evaluation_timeline": "30-60 days",
+      "current_stack": "Salesforce, Snowflake, Datadog"
+    }
+  }
+}

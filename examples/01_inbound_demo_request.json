@@ -1,0 +1,23 @@
+{
+  "_entry_point": "manual_action",
+  "_description": "Inbound demo request from MQL form \u2014 lead_qualification picks up high-intent signals, drafts the first-touch reach-out, and its tier \u00d7 intent wires hand the hot lead to the AE.",
+  "payload": {
+    "source": "inbound_form",
+    "email": "vp.eng@aurorabuild.example",
+    "first_name": "Marisol",
+    "last_name": "Park",
+    "company": "Aurora Build Systems",
+    "company_size_employees": 480,
+    "country": "US",
+    "job_title": "VP Engineering",
+    "intent_signal": "demo_request",
+    "pages_viewed": [
+      "pricing",
+      "engineering-templates",
+      "security"
+    ],
+    "campaign": "g2-summer-2026",
+    "utm_source": "g2",
+    "utm_medium": "cpc"
+  }
+}

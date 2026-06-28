@@ -1,0 +1,1027 @@
+# sales-orchestration — Sales Orchestration (lead → handoff)
+#
+# sales × saas. Multi-entry (web form, demo request, event list,
+# partner lead, scheduled pipeline-health). Lead qualification
+# (score + personalise) routes on its tier × intent wires →
+# SDR / AE handoff or MAP/CRM nurture.
+#
+# A CRO reading this file sees their sales department. Pipeline /
+# sequence / account state lives in YOUR CRM and MAP (Salesforce /
+# HubSpot / Outreach) behind n8n connectors — never in template SQLite.
+#
+# DEPTH: the four LLM judgment roles are self-reliant — each pulls its
+# own context (@pre_compose) from the dev store and enforces its own
+# deterministic floors (@chain) that the LLM cannot waive:
+#   lead_intake_agent        — agency/lead_intake_agent.py
+#   lead_qualification_agent — agency/lead_qualification_agent.py
+#   sales_research_agent     — agency/sales_research_agent.py
+#   lead_revival_agent       — agency/lead_revival_agent.py
+# The dev store (agency/_shared/store.py) is seeded with realistic
+# leads so the full chain runs end-to-end with NO connectors set; in
+# production each store read/write becomes the matching CRM/MAP
+# connector call. The connector agents (pipeline / nurture / ABM) stay
+# pure n8n YAML — their state genuinely lives in your systems. The WORM
+# audit sink (agency/_shared/audit_logger.py) is registered in main.py.
+
+name: "sales-orchestration"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 2592000
+
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+  prompt: |
+    Inbound-sales orchestration mesh. Successful lead:
+      - lead_intake normalises any-source lead AND enriches it
+        (firmographics, funding, tech stack, decision makers)
+      - lead_qualification_agent scores fit to ICP + intent AND
+        crafts the personalised opening in one pass, then routes
+        directly on its tier × intent × hook wires:
+        hot → ae_human; warm high-intent or low-hook → sdr_human;
+        warm/cold with a usable hook → deal_nurturer (MAP/CRM)
+      - sdr_human reviews high-tier sequences
+      - ae_human takes handoff on MQL → SQL transition
+
+    Escalate when:
+      - hot_lead unrouted within 5 min (SLA)
+      - SDR queue > 100 unworked leads in 24h
+      - top-tier ICP-A lead with no AE assigned within 30 min
+
+  routing:
+    mode: "learning"
+    memory_size: 300
+    confidence_threshold: 0.7
+    fallback: "all"
+    decay_days: 30
+
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "sales_playbook"
+
+  escalation:
+    targets:
+      - type: "human_agent"
+        agent: "sales_manager_human"
+      - type: "webhook"
+        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+        payload_template:
+          incident_id: "{{lead_id}}"
+          severity: "{{severity}}"
+          message: "{{message}}"
+          session_id: "{{session_id}}"
+      - type: "channel"
+        provider: "slack"
+        channel_id: "${SLACK_SALES_CHANNEL:}"
+        message_template: "[sales] {{message}} — lead {{lead_id}}"
+    auto_escalate:
+      max_retries: 2
+      max_errors_per_session: 3
+      timeout_threshold: 2
+
+  health_check_interval: 60
+  agent_timeout_threshold: 300
+  chain_completion_timeout: 600
+
+mesh:
+  call_timeout: 120
+
+data_structures:
+  Lead:
+    type: "object"
+    properties:
+      lead_id: { type: "string" }
+      source: { type: "string" }        # webform | demo | event | partner | manual
+      company_domain: { type: "string" }
+      email: { type: "string" }
+      job_title: { type: "string" }
+      intent_signal: { type: "string" }
+      received_at_utc: { type: "string" }
+      raw_payload: { type: "object" }
+    required: ["source"]
+
+entry_points:
+  - name: "webform_lead"
+    target: "lead_intake_agent"
+    description: "Marketing website form submit"
+
+  - name: "demo_request"
+    target: "lead_intake_agent"
+    description: "Demo / trial request"
+
+  - name: "event_list"
+    target: "lead_intake_agent"
+    description: "Trade show / webinar / event-list batch ingest"
+
+  - name: "partner_referral"
+    target: "lead_intake_agent"
+    description: "Partner-sourced lead"
+
+  - name: "scheduled_pipeline_health"
+    target: "pipeline_health_agent"
+    description: "Pipeline sweep — flag stalled / SLA-breached leads (hourly cron commented out until the CRM connector is wired)"
+
+  - name: "manual_action"
+    target: "lead_intake_agent"
+    description: "RevOps / SDR-initiated"
+
+  - name: "opp_stage_update"
+    target: "pipeline_health_agent"
+    description: "Record one opportunity stage update (mode=ingest)"
+
+  - name: "pipeline_health_sweep"
+    target: "pipeline_health_agent"
+    description: "Sweep current pipeline for stalled opps + coverage gaps (mode=report)"
+
+  - name: "pre_meeting_dossier"
+    target: "sales_research_agent"
+    description: "Build a pre-meeting dossier for an account (AE-initiated, mode=dossier)"
+
+  - name: "weekly_lead_revival"
+    target: "lead_revival_agent"
+    description: "Tue 10:00 cron — sweep 90d+ cold leads for new intent signals"
+
+  - name: "lost_deal_revival"
+    target: "lead_revival_agent"
+    description: "Closed-lost deal anniversary — recheck for re-engagement signals"
+
+  - name: "ghosted_lead_recovery"
+    target: "lead_revival_agent"
+    description: "Prospect went dark mid-cycle — design a polite re-engagement play"
+
+
+# ── Direct-call entry points (every non-human, non-terminal
+#    agent is API-addressable; bypasses the upstream chain).
+#    Use for ad-hoc invocation, debugging, programmatic ingest.
+  - name: "direct_call_lead_qualification"
+    target: "lead_qualification_agent"
+    description: "On-demand direct call to lead_qualification (llm) — bypasses upstream chain"
+
+  # ── Lyzr-inspired agents (added in 2.3.x) ──
+  - name: "direct_call_lead_intake"
+    target: "lead_intake_agent"
+    description: "Manually run intake + enrichment for a known lead (debug / replay)"
+
+  - name: "enrol_in_nurture"
+    target: "deal_nurturer_agent"
+    description: "Drop a specific lead into the nurture queue (mode=enrol)"
+
+  - name: "nurture_daily_sweep"
+    target: "deal_nurturer_agent"
+    description: "Daily sweep — advance due touches + check graduations (cron commented out until the MAP/CRM connector is wired)"
+
+  - name: "register_abm_contact"
+    target: "abm_orchestrator_agent"
+    description: "Register a contact against the account ledger (mode=register)"
+
+  - name: "coordinate_outbound_touch"
+    target: "abm_orchestrator_agent"
+    description: "Pre-send dedup check for an outbound touch (mode=coordinate)"
+
+  - name: "competitive_intel_pull"
+    target: "sales_research_agent"
+    description: "AE-initiated competitive intel pack for a deal in flight (mode=intel)"
+
+
+agents:
+
+  # ────────────────────────────────────────────────────────────
+  # lead_intake_agent — normalise + enrich (merged 2.3.x).
+  # SELF-RELIANT: agency/lead_intake_agent.py gives it
+  #   @pre_compose load_account_history — pulls the account ledger
+  #     (firmographics, funding, tech, DMs, prior touches) for the
+  #     domain from the dev store so enrichment REUSES known context.
+  #   @chain persist_intake — re-derives company_tier deterministically
+  #     (floor), upserts the lead + registers the contact (idempotent).
+  # ────────────────────────────────────────────────────────────
+  lead_intake_agent:
+    name: "lead_intake_agent"
+    agent_type: "llm"
+    description: "Normalises any-source lead → canonical Lead, then enriches with firmographics, funding, tech stack, decision makers"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 1500
+    communication_type: "chain"
+    prompt: |
+      Process the inbound lead in two stages. context["prepared_data"]
+      carries the known account ledger for this domain (firmographics,
+      funding, tech stack, decision makers, prior touches) and a
+      freemail / competitor-domain flag — REUSE it; do not re-fetch or
+      invent what is already known.
+
+      Stage 1 — NORMALISE. Extract canonical fields.
+        - lead_id: keep the inbound lead_id if present; if absent,
+          generate one as "lead-" + a short random hex string.
+        - email: lowercase it.
+        - company_domain: lowercase. If missing, derive it from the
+          email's domain — UNLESS the email is a freemail address.
+          Freemail domains (never derive company_domain from these;
+          leave it empty for downstream lookup): gmail.com,
+          yahoo.com, hotmail.com, outlook.com, icloud.com, aol.com,
+          proton.me, protonmail.com.
+
+      Stage 2 — ENRICH. Using the normalised company_domain, add
+      everything you can infer or fetch about the company. If a
+      field is unknown, use 0 / "" / [] — do NOT fabricate. Reuse
+      cached account context from your memory when the same domain
+      was enriched recently.
+
+      Deterministic enrichment rules — apply them exactly:
+        - company_tier: "enterprise" when employee_count >= 1000 OR
+          annual_revenue_usd >= 100000000; "mid" when
+          employee_count >= 100 OR annual_revenue_usd >= 10000000;
+          otherwise "smb". When there is NO company_domain at all,
+          use "unknown".
+        - funding_signal: true ONLY when funding.stage is one of
+          seed, series-a, series-b, series-c, series-d, growth,
+          public, bootstrapped AND funding.last_round_usd > 0.
+        - tech_stack: lowercase every entry; drop empties.
+        - high_fit_tech: the subset of tech_stack that appears in
+          this high-fit list (sorted): salesforce, hubspot,
+          snowflake, databricks, stripe, shopify, atlassian,
+          datadog, okta.
+        - decision_makers: keep ONLY entries that have BOTH a name
+          and a title; cap the list at 10.
+          decision_maker_count = length of the filtered list.
+        - enrichment_confidence: sum these weights for each
+          condition that holds — 0.30 if employee_count > 0;
+          0.10 if industry is non-empty; 0.20 if tech_stack is
+          non-empty; 0.20 if decision_makers is non-empty;
+          0.10 if funding_signal is true; 0.10 if country is
+          non-empty. Round to 2 decimals.
+        - enrichment_complete: true when
+          enrichment_confidence >= 0.5.
+
+      Return JSON with these keys (all required):
+        - lead_id: string
+        - source: string (webform | demo | event | partner | manual)
+        - company_domain: string
+        - email: string
+        - job_title: string
+        - intent_signal: string
+        - raw_payload: object (the original inbound payload)
+        - firmographics: { employee_count, annual_revenue_usd,
+            industry (lowercase), country (UPPERCASE) }
+        - funding: { stage, last_round_usd, last_round_date }
+        - tech_stack: list of tools/platforms (lowercase)
+        - decision_makers: list of { name, title, linkedin_url }
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"lead_id": "", "source": "", "company_domain": "", "email": "", "job_title": "", "intent_signal": "", "raw_payload": {}, "firmographics": {}, "company_tier": "", "funding": {}, "funding_signal": false, "tech_stack": [], "high_fit_tech": [], "decision_makers": [], "decision_maker_count": 0, "enrichment_confidence": 0, "enrichment_complete": false}
+    enforce_yields: true
+    enforce_yields_retry: 3
+    # Native SDK memory replaces the hand-rolled feed write the old
+    # module did (`write_feed_memory(account:{domain})`): repeat
+    # leads from the same domain reuse cached account context
+    # natively across sessions.
+    memory:
+      strategy: "hybrid"
+      cross_session: true
+      cross_session_limit: 50
+    # knowledge: firmographics kept from the absorbed enrichment
+    # agent (intake stage had no knowledge group; enrichment is the
+    # stage that needs KB context).
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "firmographics"
+    yields:
+      lead_id: "string"
+      source: "string"
+      company_domain: "string"
+      email: "string"
+      job_title: "string"
+      intent_signal: "string"
+      raw_payload: "object"
+      firmographics: "object"
+      company_tier: "string"
+      funding: "object"
+      funding_signal: "boolean"
+      tech_stack: "list"
+      high_fit_tech: "list"
+      decision_makers: "list"
+      decision_maker_count: "number"
+      enrichment_confidence: "number"
+      enrichment_complete: "boolean"
+    inputs:
+      payload: "object"
+      upstream_yields: "object"
+    can_call:
+      # Qualify next — lead_qualification gets firmographics +
+      # tech_stack + decision_makers as context
+      - agent: "lead_qualification_agent"
+
+      # In parallel, register with ABM orchestrator to check for
+      # account-level patterns
+      - agent: "abm_orchestrator_agent"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # lead_qualification_agent — score + personalise (merged 2.3.x).
+  # The SDR-researcher role: scores ICP + intent AND writes the
+  # personalised opener in one call, then routes on its tier × intent
+  # matrix.
+  # SELF-RELIANT: agency/lead_qualification_agent.py gives it
+  #   @pre_compose load_lead_context — pulls enrichment + the account
+  #     ledger + prior touches from the dev store so it scores over
+  #     real history.
+  #   @chain enforce_qualification_floors — the floors the LLM CANNOT
+  #     waive: clamp scores, competitor-domain short-circuit, spam
+  #     drop, hook-quality floor, and tier RE-DERIVED from the score
+  #     bands (the LLM may name a tier but never inflate it past what
+  #     the scores justify). The tier × intent can_call matrix reads
+  #     these floored keys — routing is governed by Python, not the LLM.
+  #   @compose — the AE gets the full briefing + opener; the nurturer
+  #     only the routing keys; research the competitor signal; audit a
+  #     flat event.
+  # ────────────────────────────────────────────────────────────
+  lead_qualification_agent:
+    name: "lead_qualification_agent"
+    agent_type: "llm"
+    description: "Scores fit to ICP + intent → tier, then drafts the personalised opening citing specific signals; its wires carry the tier × intent routing matrix"
+    model: "claude-sonnet-4-6"
+    temperature: 0.2
+    max_completion_tokens: 2000
+    communication_type: "chain"
+    prompt: |
+      You are the SDR researcher for this lead. context["prepared_data"]
+      carries the lead's enrichment, the account ledger (firmographics,
+      decision makers, competitor overlap) and prior touches — score
+      over THAT, not guesses. You own two responsibilities in one pass.
+
+      (Your scores and tier are run through a deterministic floor after
+      you respond: scores are clamped, a competitor domain is forced to
+      is_competitor, and the tier is re-derived from the score bands —
+      so be honest; inflating a tier will be corrected and only loses
+      you the routing you intended.)
+
+      Responsibility 1 — SCORE. Fit the lead to our ICP and read
+      its intent signals.
+
+      Responsibility 2 — PERSONALISE. Draft a personalised opening
+      for the lead. Cite 1-2 specific signals (their company
+      recently launched X, they downloaded Y guide, they attended
+      Z webinar). NO generic "Hi {{name}}". If you can't find a
+      personalisation hook, say so (low hook_quality). Skip the
+      opening (empty string) when tier is spam or the lead is a
+      competitor employee.
+
+      Deterministic rules — apply them exactly:
+        - icp_fit and intent_score MUST be clamped to 0..1.
+        - hook_quality MUST be clamped to 0..1. If cited_signals
+          is empty, hook_quality MUST NOT exceed 0.4 (no signal,
+          no hook).
+        - tier MUST be exactly one of: cold, warm, hot, spam.
+          If you are unsure, derive it from the scores:
+          icp_fit + intent_score < 0.4 AND intent_score < 0.1 →
+          spam; icp_fit + intent_score < 1.0 → cold;
+          icp_fit + intent_score < 1.5 → warm; otherwise hot.
+        - sales_briefing MUST never be empty. If you have nothing
+          richer, synthesise: tier (with ICP-fit + intent scores),
+          the top signal, and the recommended action — hot = "AE
+          direct call today", warm = "SDR sequence + manager
+          review", cold = "automated nurture", spam = "drop".
+        - lead_id: echo the lead_id from the upstream lead
+          unchanged.
+
+      Return JSON with these keys (all required):
+        - icp_fit: 0..1
+        - intent_score: 0..1
+        - tier: cold | warm | hot | spam
+        - reasons: list of specific signals (industry match, job title,
+          intent words from form, company size, etc.)
+        - is_competitor: true if lead is from a competitor employee
+        - sales_briefing: 2-3 sentence narrative for the SDR / AE.
+          Lead with tier + ICP-fit. Cite 1-2 strongest signals.
+          Recommend the next action (immediate call, sequence, nurture).
+        - opening: string
+        - cited_signals: list
+        - hook_quality: number
+        - lead_id: string (passthrough)
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"icp_fit": 0, "intent_score": 0, "tier": "", "reasons": [], "is_competitor": false, "sales_briefing": "", "opening": "", "cited_signals": [], "hook_quality": 0, "lead_id": ""}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    # knowledge: icp_definition kept (scoring is the gating judgment
+    # for everything downstream); the absorbed personalisation_signals
+    # group was dropped.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "icp_definition"
+    yields:
+      icp_fit: "number"
+      intent_score: "number"
+      tier: "string"
+      reasons: "list"
+      is_competitor: "boolean"
+      sales_briefing: "string"
+      opening: "string"
+      cited_signals: "list"
+      hook_quality: "number"            # 0..1; <0.5 → SDR human review forced
+      lead_id: "string"                 # Identity passthrough — SDR/AE sees WHICH lead
+    inputs:
+      upstream_yields: "object"
+    can_call:
+      # ── tier × intent routing matrix (was sequence_orchestrator_agent,
+      #    deleted in the YAML-first restructure). One edge per matrix
+      #    row. The cadence day-offsets noted per row no longer execute
+      #    here — sequencing cadences live in your MAP / sequencer
+      #    (e.g. Outreach / Salesloft).
+
+      # Row: tier=hot → owner=ae, cadence [0,1,3], no review
+      - agent: "ae_human"
+        condition: "calling_agent_response.tier == 'hot' and calling_agent_response.is_competitor == false"
+
+      # Row: tier=warm + intent>=0.7 → owner=sdr, manager review,
+      #      cadence [0,2,5,10]
+      - agent: "sdr_human"
+        condition: "calling_agent_response.tier == 'warm' and calling_agent_response.intent_score >= 0.7 and calling_agent_response.is_competitor == false"
+
+      # Row: tier=warm standard (intent<0.7) + hook-quality floor —
+      #      hook < 0.5 forces SDR review, cadence [0,3,7,14]
+      - agent: "sdr_human"
+        condition: "calling_agent_response.tier == 'warm' and calling_agent_response.intent_score < 0.7 and calling_agent_response.hook_quality < 0.5 and calling_agent_response.is_competitor == false"
+
+      # Row: tier=cold + hook-quality floor — hook < 0.5 forces SDR
+      #      review even on cold, cadence [0,7,21]
+      - agent: "sdr_human"
+        condition: "calling_agent_response.tier == 'cold' and calling_agent_response.hook_quality < 0.5 and calling_agent_response.is_competitor == false"
+
+      # Row: tier=warm standard (intent<0.7), usable hook → automated
+      #      nurture, cadence [0,3,7,14]
+      - agent: "deal_nurturer_agent"
+        condition: "calling_agent_response.tier == 'warm' and calling_agent_response.intent_score < 0.7 and calling_agent_response.hook_quality >= 0.5 and calling_agent_response.is_competitor == false"
+
+      # Row: tier=cold, usable hook → automated nurture (no human),
+      #      cadence [0,7,21]
+      - agent: "deal_nurturer_agent"
+        condition: "calling_agent_response.tier == 'cold' and calling_agent_response.hook_quality >= 0.5 and calling_agent_response.is_competitor == false"
+
+      # NOTE: the old sequence_orchestrator owner=='sales_manager' →
+      # audit edge was dead config — the matrix never produced that
+      # owner. Documented here instead of re-created.
+
+      # If the lead mentioned / is from a competitor → pull intel
+      # before further action. (No auto-trash; gives AE context.)
+      - agent: "sales_research_agent"
+        condition: "calling_agent_response.is_competitor == true and calling_agent_response.tier != 'spam'"
+
+      - agent: "sales_audit_logger_agent"
+        condition: "calling_agent_response.tier == 'spam'"
+
+  # ────────────────────────────────────────────────────────────
+  # pipeline_health_agent — pipeline health desk (merged 2.3.x;
+  # connector-only since the YAML-first restructure).
+  # Opportunity-stage state lives in YOUR CRM (Salesforce /
+  # HubSpot) — the template's SQLite ledger was deleted. The n8n
+  # workflow queries the CRM and returns JSON in the yields shape
+  # below.
+  # ────────────────────────────────────────────────────────────
+  pipeline_health_agent:
+    name: "pipeline_health_agent"
+    agent_type: "programmatic"
+    description: "Pipeline health — SLA/queue sweep, opportunity-stage state from your CRM, idle warnings, per-rep coverage"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # Point at an n8n workflow that reads opportunity stages from
+      # your CRM (Salesforce / HubSpot) and answers in the yields
+      # shape declared below.
+      webhook_url: "${N8N_PIPELINE_HEALTH_WEBHOOK_URL:}"
+    # wake_up: "0 * * * *"              # enable after wiring your MAP/CRM connector
+    # The connector workflow returns this JSON shape; downstream
+    # conditions reference these keys, and lenient yields
+    # enforcement fills any the workflow omits.
+    yields:
+      breached_leads: "list"
+      queue_size: "number"
+      escalate: "boolean"
+      lead_id: "string"                 # Identity passthrough — manager sees WHICH lead breached
+      mode: "string"
+      total_open_opps: "number"
+      stage_distribution: "object"
+      weighted_pipeline_cents: "number"
+      idle_opps_count: "number"
+      idle_opps: "list"
+      per_rep_weighted_cents: "object"
+      requires_manager_action: "boolean"
+      pipeline_briefing: "string"
+    inputs:
+      trigger: "string"
+      mode: "string"
+      opp_id: "string"
+      account_name: "string"
+      owner_email: "string"
+      stage: "string"
+      amount_cents: "number"
+      expected_close: "string"
+    can_call:
+      - agent: "sales_manager_human"
+        condition: "calling_agent_response.escalate == true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  sdr_human:
+    name: "sdr_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "SDR — reviews + sends personalised sequence start"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 1800          # 30 min
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_sales_manager"
+      message: "escalate_to_sales_manager"
+      note: "SDR didn't respond — sales manager escalation"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      lead_id: "string"
+    can_call:
+      - agent: "sales_manager_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_sales_manager'"
+
+      - agent: "sales_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_sales_manager'"
+
+  ae_human:
+    name: "ae_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Account Executive — owns hot leads + opportunity creation"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 3600
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_sales_manager"
+      message: "escalate_to_sales_manager"
+      note: "AE didn't respond — sales manager escalation"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      lead_id: "string"
+    can_call:
+      - agent: "sales_manager_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_sales_manager'"
+
+      - agent: "sales_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_sales_manager'"
+
+  sales_manager_human:
+    name: "sales_manager_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Sales manager — escalation + queue rebalancing"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "Sales manager unavailable — held"
+    yields:
+      decision: "string"
+      directive: "string"
+    inputs:
+      lead_id: "string"
+    can_call:
+      - agent: "sales_audit_logger_agent"
+
+  sales_audit_logger_agent:
+    name: "sales_audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM — every routing + sequence + handoff"
+    framework: "custom"
+    communication_type: "execute"
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/sales_audit.jsonl"
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+    inputs:
+      session_id: "string"
+      payload: "object"
+    can_call: []
+
+  # ────────────────────────────────────────────────────────────
+  # lead_revival_agent — weekly sweep of 90d+ cold leads.
+  # Real sales pain: cold leads that turned warm (job change, funding
+  # event) get missed because no one re-checks them.
+  # SELF-RELIANT: agency/lead_revival_agent.py gives it
+  #   @pre_compose load_cold_backlog — pulls the >= 90d cold-lead
+  #     backlog (each with its new signal) from the dev store.
+  #   @chain cap_revivals — the floor: only leads with a concrete
+  #     signal are revivable, hard-capped at 20 (protect the SDR
+  #     queue), counts recomputed from the capped list.
+  # ────────────────────────────────────────────────────────────
+  lead_revival_agent:
+    name: "lead_revival_agent"
+    agent_type: "llm"
+    description: "Weekly sweep — finds cold leads whose context changed (job moves, funding, hiring)"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 1500
+    communication_type: "chain"
+    wake_up: "0 10 * * 2"               # Tuesday 10:00 — after pipeline review
+
+    prompt: |
+      context["prepared_data"] carries the cold-lead backlog (every
+      lead cold >= 90 days, each with the new signal we have on record)
+      and the revival cap. Sweep ONLY that backlog. For each, check the
+      intent signal:
+        - Job changed (now at a better-fit company OR moved to
+          decision-maker role)
+        - Company hired into a relevant role
+        - Company raised funding
+        - Public news (new product launch, expansion)
+
+      Only revive when there's a SPECIFIC signal worth acting on.
+      Reviving "just in case" burns SDR trust in the system.
+
+      Deterministic rules — apply them exactly:
+        - Cap revivable_leads at 20 per sweep (protect the SDR
+          queue). If more than 20 qualify, keep the 20 with the
+          highest confidence.
+        - total_revived = the number of entries in revivable_leads
+          (after the cap).
+        - confidence_avg MUST be clamped to 0..1.
+        - skipped_no_signal = leads checked but showing no change.
+
+      Return JSON with these keys:
+        - revivable_leads: list of {lead_id, signal, new_tier,
+          revival_reasoning}
+        - new_signals_summary: 2-3 sentence overview for SDR team
+        - total_revived: integer
+        - confidence_avg: 0..1
+        - skipped_no_signal: integer (leads checked but no change)
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"revivable_leads": [], "new_signals_summary": "", "total_revived": 0, "confidence_avg": 0, "skipped_no_signal": 0}
+
+    enforce_yields: true
+    enforce_yields_retry: 1
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "intent_signals"
+
+    yields:
+      revivable_leads: "list"
+      new_signals_summary: "string"
+      total_revived: "number"
+      confidence_avg: "number"
+      skipped_no_signal: "number"
+
+    inputs:
+      trigger: "string"
+
+    can_call:
+      - agent: "sdr_human"
+        condition: "calling_agent_response.total_revived > 0"
+
+      - agent: "sales_audit_logger_agent"
+        condition: "calling_agent_response.total_revived == 0"
+
+  # ────────────────────────────────────────────────────────────
+  # sales_research_agent — deal + account research desk (merged
+  # 2.3.x). One researcher role, mode-dispatched:
+  #   mode=intel   → per-deal competitor intel pack
+  #   mode=dossier → pre-meeting account dossier
+  # SELF-RELIANT: agency/sales_research_agent.py gives it
+  #   @pre_compose load_research_seed — pulls the account ledger
+  #     (facts, DMs, competitor overlap) for the account from the dev
+  #     store so the dossier/intel is grounded.
+  #   @chain score_research_floor — re-computes dossier_score from the
+  #     dossier contents (floor) and sets requires_more_data from the
+  #     0.5 gate; in intel mode forces requires_more_data=false; bounds
+  #     the research ⇄ qualification ping-pong via the session stash.
+  # ────────────────────────────────────────────────────────────
+  sales_research_agent:
+    name: "sales_research_agent"
+    agent_type: "llm"
+    description: "Sales research — competitor intel pack (mode=intel) or pre-meeting account dossier (mode=dossier)"
+    model: "claude-sonnet-4-6"
+    temperature: 0.1
+    max_completion_tokens: 1800
+    communication_type: "chain"
+
+    prompt: |
+      You are the sales research desk. context["prepared_data"] carries
+      the dispatched mode and the known account ledger (facts, decision
+      makers, competitor overlap) for the account — ground your pack in
+      that. You own two responsibilities; run the one the mode calls for.
+      (dossier_score and requires_more_data are recomputed by a
+      deterministic floor after you respond — fill the dossier richly.)
+
+      MODE DISPATCH — apply exactly, in this order:
+        1. An explicit mode in the request wins ("intel" /
+           "competitive_intel" → intel; "dossier" /
+           "account_dossier" → dossier).
+        2. Otherwise: named competitors anywhere in the request, or
+           a competitor-flagged lead (is_competitor true) → intel.
+        3. Otherwise default to dossier.
+
+      Responsibility A — COMPETITOR INTEL (mode=intel). Pull
+      competitive intelligence for the named competitors (lowercase
+      every name; dedupe; also count competitor_overlap entries
+      from upstream as named competitors). For each, draft these
+      fields into intel_records:
+        - competitor (lowercase name)
+        - category
+        - positioning (2 sentences max)
+        - pricing_signal (only if confirmed public)
+        - switching_pain (what would need to be moved if we won)
+        - our_advantages (max 3, specific to the competitor)
+        - their_advantages (max 3 — be honest)
+        - talk_tracks (max 3, conversational)
+        - loss_themes (why we typically lose to them)
+      Intel rules — apply exactly:
+        - competitors_analysed: the sorted lowercase competitor names.
+        - A competitor you know nothing about still gets a record
+          (category "unknown", positioning "not yet in KB") AND its
+          name goes into kb_curation_needed_for.
+        - primary_threat: the most established competitor (first
+          with a recognised category, with known switching pain);
+          primary_threat_reasoning explains why in one sentence.
+        - requires_pricing_objection_prep: true when pricing was
+          mentioned upstream OR any analysed competitor has a
+          public pricing_signal.
+        - briefing: short summary — competitors in deal, primary
+          threat, lead-with advantage.
+        - ae_briefing_appendix: the fuller pack — per competitor:
+          positioning, pricing, our edges, talk tracks, KB-curation
+          flags.
+        - In intel mode requires_more_data is ALWAYS false (intel
+          packs land in the audit trail and must never trigger the
+          dossier → opener edge), and the dossier-only keys stay at
+          their empty defaults.
+      Be positional, not promotional. The AE decides what to use.
+
+      Responsibility B — ACCOUNT DOSSIER (mode=dossier). Build a
+      clean account dossier for the upcoming meeting:
+        - account: string company name
+        - domain: string company domain
+        - company_facts: list of recent meaningful facts (3-7 items)
+        - decision_makers: list of objects (name, title, email,
+            engagement_signal)
+        - recent_signals: list of objects (kind, evidence, ts)
+        - competitor_overlap: list of competitor names where the
+          account shows usage / interest
+        - talking_points: list of 3-5 opener lines for the meeting
+        - risk_flags: list of objects (kind, note)
+      Dossier rules — apply exactly:
+        - dossier_score: sum these weights for each condition that
+          holds — 0.15 if company_facts has >= 3 items; 0.25 if
+          decision_makers has >= 1; 0.20 if recent_signals has
+          >= 1; 0.20 if talking_points has >= 3; 0.10 if
+          competitor_overlap has >= 1; 0.10 if risk_flags is
+          EMPTY. Round to 2 decimals.
+        - requires_more_data: true when dossier_score < 0.5.
+        - research_briefing MUST never be empty: 2-3 sentence
+          narrative for the AE. Lead with the strongest hook. Name
+          the DM to open with. If data is thin, synthesise it from
+          the dossier score, the lead DM, the top talking point,
+          the recent-signal count and whether risk flags exist.
+        - In dossier mode the intel-only keys stay at their empty
+          defaults.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"mode": "", "competitors_analysed": [], "intel_records": [], "primary_threat": "", "primary_threat_reasoning": "", "briefing": "", "ae_briefing_appendix": "", "requires_pricing_objection_prep": false, "kb_curation_needed_for": [], "account": "", "domain": "", "company_facts": [], "decision_makers": [], "recent_signals": [], "competitor_overlap": [], "talking_points": [], "risk_flags": [], "dossier_score": 0, "requires_more_data": false, "research_briefing": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    # knowledge: competitor_landscape — both absorbed agents already
+    # used this group; no choice to make.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "competitor_landscape"
+
+    yields:
+      mode: "string"                    # intel | dossier
+      # mode=intel
+      competitors_analysed: "list"
+      intel_records: "list"
+      primary_threat: "string"
+      primary_threat_reasoning: "string"
+      briefing: "string"
+      ae_briefing_appendix: "string"
+      requires_pricing_objection_prep: "boolean"
+      kb_curation_needed_for: "list"
+      # mode=dossier
+      account: "string"
+      domain: "string"
+      company_facts: "list"
+      decision_makers: "list"
+      recent_signals: "list"
+      competitor_overlap: "list"
+      talking_points: "list"
+      risk_flags: "list"
+      dossier_score: "number"
+      requires_more_data: "boolean"
+      research_briefing: "string"
+
+    inputs:
+      upstream_yields: "object"
+      mode: "string"
+      competitors: "list"
+      company: "string"
+      domain: "string"
+
+    can_call:
+      # Strong dossier → lead_qualification drafts the opener message
+      - agent: "lead_qualification_agent"
+        condition: "calling_agent_response.mode == 'dossier' and calling_agent_response.requires_more_data == false"
+
+      # Intel packs always land in the audit trail (AE reads via
+      # stored yields); weak dossier → terminal (operator decides)
+      - agent: "sales_audit_logger_agent"
+        condition: "calling_agent_response.mode == 'intel' or calling_agent_response.requires_more_data == true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # deal_nurturer_agent — drip touches for mid-funnel leads
+  # (connector-only since the YAML-first restructure).
+  # Nurture sequences and engagement state live in YOUR MAP / CRM
+  # (Outreach / HubSpot) — the template's SQLite ledger was
+  # deleted. The n8n workflow enrols / sweeps in the real system
+  # and returns JSON in the yields shape below.
+  # ────────────────────────────────────────────────────────────
+  deal_nurturer_agent:
+    name: "deal_nurturer_agent"
+    agent_type: "programmatic"
+    description: "Multi-touch nurture for leads not yet AE-ready; graduates on engagement signals"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # Point at an n8n workflow that enrols / sweeps nurture
+      # sequences in your MAP / CRM (Outreach / HubSpot) and
+      # answers in the yields shape declared below.
+      webhook_url: "${N8N_NURTURE_WEBHOOK_URL:}"
+    # wake_up: "30 8 * * *"             # enable after wiring your MAP/CRM connector
+
+    # The connector workflow returns this JSON shape; downstream
+    # conditions reference these keys, and lenient yields
+    # enforcement fills any the workflow omits.
+    yields:
+      action: "string"                  # enrolled | sweep | skipped
+      enrolled: "boolean"
+      lead_id: "string"
+      tier: "string"
+      company_tier: "string"
+      cadence_days: "list"
+      touches_planned: "number"
+      first_touch_utc: "string"
+      touched_count: "number"
+      touched: "list"
+      graduated_lead_ids: "list"
+      graduated_count: "number"
+      exhausted_lead_ids: "list"
+      exhausted_count: "number"
+      requires_ae_handoff: "boolean"
+      swept_at_utc: "string"
+
+    inputs:
+      mode: "string"                    # enrol | sweep
+      upstream_yields: "object"
+      engagement: "object"              # per-lead opens/clicks/replies for sweep
+
+    narration: |
+      Two modes:
+        enrol → new lead routed from lead_qualification's tier ×
+          intent wires (warm/cold with a usable hook) into the
+          nurture queue in your MAP / CRM
+        sweep → daily pass; advance touches due, check graduation
+
+      Graduation threshold: 0.70 — engagement signal score from
+      opens/clicks/replies/page_visits crosses → AE handoff.
+
+    can_call:
+      # When a lead graduates → AE
+      - agent: "ae_human"
+        condition: "calling_agent_response.requires_ae_handoff == true"
+
+      # Otherwise → audit
+      - agent: "sales_audit_logger_agent"
+        condition: "calling_agent_response.requires_ae_handoff == false"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # abm_orchestrator_agent — account-level coordination
+  # Two modes: register (new lead) + coordinate (dedup touches).
+  # Connector-only since the YAML-first restructure: the
+  # account / contact ledger lives in YOUR CRM (Salesforce /
+  # HubSpot) — the template's SQLite ledger was deleted. The n8n
+  # workflow registers / dedupes in the real system and returns
+  # JSON in the yields shape below.
+  # ────────────────────────────────────────────────────────────
+  abm_orchestrator_agent:
+    name: "abm_orchestrator_agent"
+    agent_type: "programmatic"
+    description: "Detects 3+ contacts from same domain → flips account to coordinated ABM mode"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      # Point at an n8n workflow that keeps the account/contact
+      # ledger in your CRM (Salesforce / HubSpot) and answers in
+      # the yields shape declared below.
+      webhook_url: "${N8N_ABM_WEBHOOK_URL:}"
+
+    # The connector workflow returns this JSON shape; downstream
+    # conditions reference these keys, and lenient yields
+    # enforcement fills any the workflow omits.
+    yields:
+      action: "string"                  # registered | coordinate | skipped
+      company_domain: "string"
+      lead_id: "string"
+      contacts_in_window: "number"
+      threshold: "number"
+      abm_mode_active: "boolean"
+      abm_mode_activated: "boolean"
+      owner_ae: "string"
+      briefing: "string"
+      requires_marketing_air_cover: "boolean"
+      safe_to_send: "boolean"
+      reason: "string"
+      blocking_lead_id: "string"
+      blocking_sent_at_utc: "string"
+      dedup_days: "number"
+      channel: "string"
+      logged_at_utc: "string"
+
+    inputs:
+      mode: "string"                    # register | coordinate
+      upstream_yields: "object"
+      company_domain: "string"
+      channel: "string"                 # email | linkedin | call
+
+    narration: |
+      Window 14d; threshold 3 contacts. On activation:
+        · ONE AE assigned (deterministic — hash of domain)
+        · Marketing air-cover requested (LinkedIn ABM ads)
+        · All future touches go through coordinate mode for dedup
+
+    can_call:
+      # On ABM activation → AE owner gets the briefing
+      - agent: "ae_human"
+        condition: "calling_agent_response.abm_mode_activated == true"
+
+      # Always audit the registration/coordination
+      - agent: "sales_audit_logger_agent"
+
+    auto_store_response: true
+    auto_store_yields: true

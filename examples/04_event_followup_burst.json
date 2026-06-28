@@ -1,0 +1,13 @@
+{
+  "_entry_point": "manual_action",
+  "_description": "Conference scanned 320 badges \u2014 bulk follow-up. lead_qualification dedupes + ranks by signal strength.",
+  "payload": {
+    "source": "event_scan",
+    "event_name": "AI Operations Summit 2026",
+    "event_date": "2026-06-03",
+    "lead_count": 320,
+    "high_intent_count": 47,
+    "average_seniority_score": 0.62,
+    "campaign": "aiops-summit-2026"
+  }
+}

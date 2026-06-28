@@ -1,0 +1,37 @@
+{
+  "scenario": "Daily nurture sweep — advance touches, graduate hot ones",
+  "entry_point": "nurture_daily_sweep",
+  "expected_flow": [
+    "deal_nurturer_agent (sweep mode) → n8n workflow sweeps active nurtures in your MAP/CRM (Outreach / HubSpot)",
+    "→ advances touches due (sends next email/linkedin/call)",
+    "→ graduates leads whose engagement_score >= 0.70 → ae_human",
+    "→ exhausts leads who finished cadence without graduating → audit"
+  ],
+  "payload": {
+    "mode": "sweep",
+    "trigger": "cron",
+    "engagement": {
+      "lead-aaa11122233": {
+        "opens": 4,
+        "clicks": 2,
+        "replies": 1,
+        "page_visits": 3,
+        "days_since_last_touch": 3
+      },
+      "lead-bbb44455566": {
+        "opens": 2,
+        "clicks": 0,
+        "replies": 0,
+        "page_visits": 1,
+        "days_since_last_touch": 7
+      },
+      "lead-ccc77788899": {
+        "opens": 0,
+        "clicks": 0,
+        "replies": 0,
+        "page_visits": 0,
+        "days_since_last_touch": 35
+      }
+    }
+  }
+}

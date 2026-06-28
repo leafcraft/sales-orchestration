@@ -1,0 +1,21 @@
+{
+  "scenario": "AE-initiated competitor intel pull before a meeting",
+  "entry_point": "competitive_intel_pull",
+  "expected_flow": [
+    "sales_research_agent (mode=intel) → pulls cached intel for named competitors",
+    "→ picks primary threat (most established with switching pain)",
+    "→ assembles AE briefing appendix with talk tracks",
+    "→ flags pricing_objection_prep if pricing was mentioned",
+    "→ audit log"
+  ],
+  "payload": {
+    "competitors": ["salesforce", "hubspot"],
+    "upstream_yields": {
+      "lead_id": "lead-meeting-prep-001",
+      "company_domain": "globex-saas.com",
+      "tier": "hot",
+      "pricing_mentioned": true,
+      "competitor_overlap": ["salesforce"]
+    }
+  }
+}

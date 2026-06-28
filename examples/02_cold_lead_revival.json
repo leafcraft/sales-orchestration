@@ -1,0 +1,21 @@
+{
+  "_entry_point": "weekly_lead_revival",
+  "_description": "Cron-fired weekly revival sweep \u2014 picks up cold leads with new intent signals and drafts re-engagement sequences.",
+  "payload": {
+    "sweep_id": "revival-2026-23",
+    "lead_cohort": "cold_90d_with_recent_intent",
+    "leads": [
+      {
+        "email": "buyer@bigcorp.example",
+        "company": "BigCorp",
+        "last_touched_days": 105,
+        "new_intent_signals": [
+          "g2_competitor_research",
+          "linkedin_engagement"
+        ],
+        "previous_outcome": "no_response"
+      }
+    ],
+    "kicked_off_at_utc": "2026-06-04T10:00:00Z"
+  }
+}
