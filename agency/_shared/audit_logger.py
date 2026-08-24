@@ -12,7 +12,7 @@ an *intelligence function* registered on the LeafMesh instance:
 that path is kept below for backwards compatibility and no-ops when
 the module is absent.)
 
-Dev mode writes hash-chained JSON lines to ./logs/audit.jsonl.
+Dev mode writes hash-chained JSON lines to ./logs/sales_audit.jsonl.
 Production swaps `_dispatch_local` for S3 Object Lock / Datadog Audit
 Trail / Splunk HEC.
 
@@ -39,7 +39,7 @@ _LAST_HASH = "GENESIS"
 # Default sink — overridden by connector_config in config.yaml when the
 # SDK passes it through; kept as module default so the intelligence
 # path (which receives no connector_config) still lands in the same file.
-DEFAULT_AUDIT_PATH = "./logs/audit.jsonl"
+DEFAULT_AUDIT_PATH = "./logs/sales_audit.jsonl"
 
 # Human/meta keys that are transport plumbing, not audit payload.
 _META_KEYS = frozenset({

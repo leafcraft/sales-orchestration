@@ -26,7 +26,14 @@ from pathlib import Path
 from typing import Any
 
 _LOCK = threading.Lock()
+_CLAIM_LOCK = threading.Lock()
 _DIR = Path("./data")
+
+# Shared cold-lead sweep queue — populated lazily from the >=90d backlog, drained
+# atomically by claim_cold_leads() so lead_revival_agent's parallel instances each
+# claim a DISJOINT batch (in-process; a multi-replica deployment swaps this for a
+# Redis LPOP). See agency/tools.py:claim_cold_leads.
+_claim_queue: "list[dict[str, Any]] | None" = None
 
 _FREEMAIL = frozenset({
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com",
@@ -347,3 +354,55 @@ def cold_leads_due(min_days_cold: int = 90) -> list[dict[str, Any]]:
             out.append(lead)
     out.sort(key=lambda l: l.get("last_touch_utc", ""))
     return out
+
+
+def _ensure_claim_queue() -> list[dict[str, Any]]:
+    global _claim_queue
+    if _claim_queue is None:
+        _claim_queue = list(cold_leads_due(90))
+    return _claim_queue
+
+
+def claim_cold_leads(batch_size: int = 5) -> list[dict[str, Any]]:
+    """Atomically pop up to batch_size cold leads from the shared sweep queue.
+
+    Disjoint across concurrent callers (the revival instances). Returns [] when
+    the queue is drained. PROD: a Redis LPOP / SELECT … FOR UPDATE SKIP LOCKED.
+    """
+    n = max(1, int(batch_size or 1))
+    with _CLAIM_LOCK:
+        q = _ensure_claim_queue()
+        batch = q[:n]
+        del q[:n]
+        return batch
+
+
+def reset_claim_queue() -> None:
+    """Test/maintenance helper — refill the sweep queue on the next claim."""
+    global _claim_queue
+    with _CLAIM_LOCK:
+        _claim_queue = None
+
+
+# ── Finisher outbox + append-only ledger (Deal Desk's commits) ───────────
+def record_outbox(entry: dict[str, Any]) -> dict[str, Any]:
+    """Record a finisher send (create-opportunity / queue-to-sequencer).
+    PROD: the CRM opportunity create + the sequencer enrol."""
+    with _LOCK:
+        ob = _load("outbox")
+        entries = ob.get("entries") if isinstance(ob.get("entries"), list) else []
+        rec = {"recorded_at": _now(), **entry}
+        entries.append(rec)
+        _save("outbox", {"entries": entries})
+    return rec
+
+
+def append_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only sales ledger (dev mirror of the WORM sink for local demo)."""
+    with _LOCK:
+        lg = _load("sales_ledger")
+        entries = lg.get("entries") if isinstance(lg.get("entries"), list) else []
+        rec = {"recorded_at": _now(), **entry}
+        entries.append(rec)
+        _save("sales_ledger", {"entries": entries})
+    return rec

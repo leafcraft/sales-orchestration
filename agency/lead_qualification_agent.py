@@ -29,7 +29,7 @@ from typing import Any
 
 from leafmesh import LeafMeshLogger, chain, compose, pre_compose
 
-from agency._shared import store, util
+from agency._shared import session_stash, store, util
 
 logger = LeafMeshLogger(__name__)
 
@@ -133,6 +133,19 @@ async def enforce_qualification_floors(result: dict[str, Any], ctx: Any) -> dict
     if lead_id:
         store.record_qualification(lead_id, result["tier"], icp, intent,
                                    routed_to="(matrix)")
+        # Stash the lead context by session so the Deal Desk FINISHER can recover
+        # it across the AE human gate (the SDK re-delivers only the human-reply
+        # meta fields — the qualification payload is not re-delivered downstream).
+        session_stash.stash_put(util.sid(result, ctx), {
+            "lead_id": lead_id,
+            "tier": result["tier"],
+            "icp_fit": icp,
+            "intent_score": intent,
+            "opening": result.get("opening", ""),
+            "sales_briefing": result.get("sales_briefing", ""),
+            "company_domain": str(result.get("company_domain") or ""),
+            "cited_signals": result.get("cited_signals", []),
+        })
 
     logger.info(f"[qualify] {lead_id or '?'} tier={result['tier']} "
                 f"icp={icp:.2f} intent={intent:.2f} hook={hook:.2f} "

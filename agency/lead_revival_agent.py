@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from leafmesh import LeafMeshLogger, chain, pre_compose
+from leafmesh import LeafMeshLogger, chain, compose, pre_compose
 
 from agency._shared import store, util
 
@@ -78,7 +78,46 @@ async def cap_revivals(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
     return result
 
 
+def _reshape_instances(result: dict[str, Any]) -> dict[str, Any]:
+    """Under instances_handoff: last the SDK SUMS numbers across the parallel
+    copies — total_revived summing is correct (disjoint batches), but a summed
+    confidence_avg is nonsense. Re-derive the weighted mean from the per-copy
+    detail on result['_instances'] (present only when >1 copy ran)."""
+    inst = result.get("_instances") if isinstance(result, dict) else None
+    if isinstance(inst, dict):
+        copies = [c for c in (inst.get("results") or {}).values() if isinstance(c, dict)]
+        num = sum(float(c.get("total_revived") or 0) * util.clamp01(c.get("confidence_avg"))
+                  for c in copies)
+        den = sum(float(c.get("total_revived") or 0) for c in copies)
+        result["confidence_avg"] = round(num / den, 4) if den > 0 else 0.0
+    return result
+
+
+def _to_sdr(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """The SDR gets the revived batch with a correctly-averaged confidence."""
+    r = _reshape_instances(dict(result))
+    return {
+        "revivable_leads": r.get("revivable_leads", []),
+        "total_revived": r.get("total_revived", 0),
+        "confidence_avg": r.get("confidence_avg", 0.0),
+        "new_signals_summary": r.get("new_signals_summary", ""),
+    }
+
+
+def _to_audit(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Audit gets a flat, self-describing event (the no-revivals terminus)."""
+    r = _reshape_instances(dict(result))
+    return {
+        "session_id": util.sid(result, ctx),
+        "payload": {"event": "lead_revival",
+                    "total_revived": r.get("total_revived", 0),
+                    "confidence_avg": r.get("confidence_avg", 0.0),
+                    "skipped_no_signal": r.get("skipped_no_signal", 0)},
+    }
+
+
 @pre_compose(context_processor=load_cold_backlog)
+@compose(sdr_human=_to_sdr, sales_audit_logger_agent=_to_audit)
 @chain(cap_revivals)
 async def lead_revival_agent(llm_response: Any, input_data: Any,
                              context: Any) -> dict[str, Any]:

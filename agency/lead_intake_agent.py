@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from leafmesh import LeafMeshLogger, chain, pre_compose
+from leafmesh import LeafMeshLogger, chain, compose, pre_compose
 
 from agency._shared import store, util
 
@@ -99,7 +99,19 @@ async def persist_intake(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
     return result
 
 
+def _to_abm(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """The ABM coordinator (n8n) only needs mode + identity to register the
+    contact against the account ledger — not the whole enrichment block."""
+    return {
+        "mode": "register",
+        "company_domain": result.get("company_domain", ""),
+        "lead_id": result.get("lead_id", ""),
+        "upstream_yields": {"company_tier": result.get("company_tier", "")},
+    }
+
+
 @pre_compose(context_processor=load_account_history)
+@compose(abm_orchestrator_agent=_to_abm)
 @chain(persist_intake)
 async def lead_intake_agent(llm_response: Any, input_data: Any,
                             context: Any) -> dict[str, Any]:
