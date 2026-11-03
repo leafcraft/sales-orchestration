@@ -8,8 +8,8 @@
   ],
   "payload": {
     "source": "webform",
-    "email": "head.of.platform@acme-finance.com",
-    "company_domain": "acme-finance.com",
+    "email": "head.of.platform@acme-finance.example",
+    "company_domain": "acme-finance.example",
     "job_title": "Head of Platform Engineering",
     "intent_signal": "downloaded the 'multi-agent ROI' guide twice in 48h",
     "form_fields": {

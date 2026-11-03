@@ -12,10 +12,10 @@ The two integration points the connector agents already own
 store is only the dev stand-in for the LLM agents' context-pulls
 (@pre_compose) and their deterministic lifecycle writes (@chain).
 
-  * CRM     → wire ${N8N_ABM_WEBHOOK_URL} into account_record / register_contact
-  * MAP     → wire ${N8N_NURTURE_WEBHOOK_URL} into prior_touches / record_touch
+  * CRM     → the n8n workflow behind vault connection abm_n8n, into account_record / register_contact
+  * MAP     → the n8n workflow behind vault connection nurture_n8n, into prior_touches / record_touch
 
-Setting those env vars alone does nothing until you wire the calls here.
+Creating those connections alone does nothing until you wire the calls here.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ _CLAIM_LOCK = threading.Lock()
 _DIR = Path("./data")
 
 # Shared cold-lead sweep queue — populated lazily from the >=90d backlog, drained
-# atomically by claim_cold_leads() so lead_revival_agent's parallel instances each
+# atomically by claim_cold_leads() so lead_revival_agent's parallel copies each
 # claim a DISJOINT batch (in-process; a multi-replica deployment swaps this for a
 # Redis LPOP). See agency/tools.py:claim_cold_leads.
 _claim_queue: "list[dict[str, Any]] | None" = None
@@ -121,6 +121,23 @@ _SEED_ACCOUNTS: dict[str, Any] = {
         ],
         "competitor_overlap": [],
     },
+    "harbourline-logistics.example": {
+        "company_domain": "harbourline-logistics.example",
+        "company_name": "Harbourline Logistics",
+        "firmographics": {"employee_count": 420, "annual_revenue_usd": 61_000_000,
+                          "industry": "logistics", "country": "CA"},
+        "company_tier": "mid",
+        "funding": {"stage": "series-b", "last_round_usd": 30_000_000,
+                    "last_round_date": "2026-06-18"},
+        "funding_signal": True,
+        "tech_stack": ["salesforce", "atlassian", "datadog", "postgres"],
+        "high_fit_tech": ["atlassian", "datadog", "salesforce"],
+        "decision_makers": [
+            {"name": "Elena Marsh", "title": "Director of Revenue Operations", "linkedin_url": ""},
+            {"name": "Kofi Mensah", "title": "VP of Sales", "linkedin_url": ""},
+        ],
+        "competitor_overlap": ["competastack"],
+    },
     "tinyshop.example": {
         "company_domain": "tinyshop.example",
         "company_name": "TinyShop",
@@ -178,6 +195,28 @@ _SEED_LEADS: dict[str, Any] = {
         "received_at_utc": _days_ago(0),
         "raw_payload": {"message": "BUY CHEAP FOLLOWERS NOW"},
     },
+    # WARM, high intent (partner-referred, trial + pricing) → SDR-run sequence
+    # with manager review.
+    "lead-warm-005": {
+        "lead_id": "lead-warm-005", "source": "partner",
+        "company_domain": "harbourline-logistics.example",
+        "email": "elena.marsh@harbourline-logistics.example",
+        "job_title": "Director of Revenue Operations", "intent_signal": "trial_signup",
+        "received_at_utc": _days_ago(0),
+        "raw_payload": {"partner": "Keystone Advisory Partners",
+                        "pages_viewed": ["pricing", "integrations/salesforce"],
+                        "trial_workspace": "harbourline-trial"},
+    },
+    # COLD with a weak hook (event badge scan, no stated need) → SDR reviews
+    # before anything is sent.
+    "lead-cold-006": {
+        "lead_id": "lead-cold-006", "source": "event",
+        "company_domain": "tinyshop.example",
+        "email": "marco.bellini@tinyshop.example",
+        "job_title": "Owner", "intent_signal": "badge_scan",
+        "received_at_utc": _days_ago(3),
+        "raw_payload": {"event": "Retail Ops Summit 2026", "booth_visit_sec": 40},
+    },
 }
 
 # Cold-lead backlog for the revival sweep — some have a fresh signal
@@ -185,7 +224,7 @@ _SEED_LEADS: dict[str, Any] = {
 _SEED_COLD: dict[str, Any] = {
     "lead-cold-101": {
         "lead_id": "lead-cold-101", "company_domain": "brightside-retail.example",
-        "email": "owen.reed@brightside-retail.example", "tier": "cold",
+        "email": "maya.okafor@brightside-retail.example", "tier": "cold",
         "last_touch_utc": _days_ago(120),
         "new_signal": {"kind": "funding", "evidence": "Series-A extension announced",
                        "ts": _days_ago(5)},
@@ -199,7 +238,7 @@ _SEED_COLD: dict[str, Any] = {
     },
     "lead-cold-103": {
         "lead_id": "lead-cold-103", "company_domain": "tinyshop.example",
-        "email": "owner@tinyshop.example", "tier": "cold",
+        "email": "accounts@tinyshop.example", "tier": "cold",
         "last_touch_utc": _days_ago(95),
         "new_signal": None,                     # no signal → skipped
     },
@@ -366,7 +405,7 @@ def _ensure_claim_queue() -> list[dict[str, Any]]:
 def claim_cold_leads(batch_size: int = 5) -> list[dict[str, Any]]:
     """Atomically pop up to batch_size cold leads from the shared sweep queue.
 
-    Disjoint across concurrent callers (the revival instances). Returns [] when
+    Disjoint across concurrent callers (the revival copies). Returns [] when
     the queue is drained. PROD: a Redis LPOP / SELECT … FOR UPDATE SKIP LOCKED.
     """
     n = max(1, int(batch_size or 1))

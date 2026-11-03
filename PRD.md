@@ -39,11 +39,12 @@ ingress (webform / demo / event / partner / manual) ─► sales_coordinator_age
         ├── competitor ─────► sales_research_agent ──strong dossier──► lead_qualification
         └── spam ───────────────────────────────────────────────────────────► audit
 
- lead_revival_agent (cron Tue 10:00, instances:3 + atomic claim) ──revived──► sdr_human
+ lead_revival_agent (cron Tue 10:00, copies.count:3 + atomic claim) ──revived──► sdr_human
  pipeline_health_agent (cron off) ──escalate──► sales_manager_human
 
- human gates default-deny on timeout (held_for_review → audit); the Manager
- SUPERVISOR escalates stalls to sales_manager_human via manager.escalation.
+ nothing advances on silence: an unanswered gate closes its Inbox card and the
+ ticket records that no reply came. The Manager SUPERVISOR escalates repeated /
+ unfixable agent errors to sales_manager_human via manager.escalation.
  sales_audit_logger_agent = hash-chained WORM terminus on every branch.
 ```
 
@@ -55,7 +56,7 @@ ingress (webform / demo / event / partner / manual) ─► sales_coordinator_age
 | lead_intake_agent | Lead Intake & Enrichment Researcher | llm |
 | lead_qualification_agent | SDR Researcher (Scoring & Personalisation) | llm |
 | sales_research_agent | Sales Research Desk | llm (super_agent) |
-| lead_revival_agent | Lead Revival Specialist | llm (cron, instances) |
+| lead_revival_agent | Lead Revival Specialist | llm (cron, scaling.copies) |
 | deal_desk_agent | Opportunity & Outreach Liaison | programmatic (FINISHER) |
 | pipeline_health_agent | Pipeline Health Analyst | programmatic (n8n) |
 | deal_nurturer_agent | Nurture / Demand-Gen Coordinator | programmatic (n8n) |
@@ -105,10 +106,10 @@ See `configs/config.yaml` for the authoritative spec. Summary:
   (`get_account_facts`, `list_decision_makers`, `list_competitor_overlap`) that
   announce `available:false`; commented enrichment `mcp` block for going live.
 - **lead_revival_agent** (llm, gpt-4o-mini, cron Tue 10:00 `Asia/Kolkata`,
-  **instances: 3**) — `@pre_compose load_cold_backlog`; `@chain cap_revivals`
+  **`scaling.copies.count: 3`**) — `@pre_compose load_cold_backlog`; `@chain cap_revivals`
   keeps only signal-backed leads, hard-capped at 20; an **atomic claim tool**
   (`claim_cold_leads`) fans the backlog across the copies (disjoint batches);
-  `@compose` re-derives the mean confidence under the instances merge.
+  `@compose` re-derives the mean confidence under the copies merge (`copies.handoff: last`).
 - **deal_desk_agent** (programmatic, **FINISHER**) — the actuator behind the AE
   gate: approve-token re-check (allow/deny lists, **unknown fails closed**) →
   deterministic invariants (committable tier, lead on record) → render the
@@ -117,9 +118,12 @@ See `configs/config.yaml` for the authoritative spec. Summary:
 - **pipeline_health_agent / deal_nurturer_agent / abm_orchestrator_agent**
   (programmatic, n8n) — connector-only; CRM/MAP owns pipeline / nurture /
   account-ledger state. No template Python.
-- **ae_human / sdr_human / sales_manager_human** (human gates) — default-deny
-  fallbacks (60 min / 30 min / 4 h) → `held_for_review` → audit. No human→human
-  wire (dual↔dual is a footgun); the Manager supervisor escalates stalls.
+- **ae_human / sdr_human / sales_manager_human** (human gates, 60 min / 30 min /
+  4 h). Only an explicit "approved" from the AE reaches the finisher. If nobody
+  answers in time, the request waits no longer: its Inbox card closes and the
+  ticket records that no reply came — nothing is committed. The declared
+  fallback (`held_for_review` → audit) is kept in config; on SDK 2.4.486 a dual
+  seat does not route it. No human→human wire (dual↔dual is a footgun).
 - **sales_audit_logger_agent** (external custom) — hash-chained WORM, executed
   via `mesh.intelligence()` from `agency/_shared/audit_logger.py`.
 
@@ -137,8 +141,10 @@ qualification.
 
 ## 7. Controls & trust
 
-- **Human gates default-deny on timeout** — held_for_review → audit; the Manager
-  escalates to the Sales Manager. No silent advance.
+- **Nothing advances on silence** — an unanswered gate closes its Inbox card and
+  the ticket records that no reply came; nobody is chased automatically. The
+  Manager escalates only agent errors (unfixable, or 3 failed agents in one
+  session) to the Sales Manager.
 - **The tier is earned, not claimed** — the tier × intent matrix reads the keys
   the Python `@chain` floored; the LLM cannot inflate a tier past its scores.
 - **The finisher fails closed** — unknown approval verdict = blocked; a
@@ -158,7 +164,7 @@ Python lives where a role genuinely needs hands:
 - `agency/lead_qualification_agent.py` — lead-context pull, score/tier/hook floors,
   per-downstream shapers, finisher stash.
 - `agency/sales_research_agent.py` — dossier seed, dossier-score floor + bounded loop.
-- `agency/lead_revival_agent.py` — cold-backlog pull, 20-cap floor, instances reshape.
+- `agency/lead_revival_agent.py` — cold-backlog pull, 20-cap floor, copies-merge reshape.
 - `agency/deal_desk_agent.py` — the fail-closed commit floor (the finisher).
 - `agency/tools.py` — day-0 `@global_tool` surfaces (research reads + atomic claim).
 - `agency/_shared/store.py` — seeded dev store (CRM/MAP stand-in) + outbox/ledger.
@@ -177,7 +183,7 @@ Python lives where a role genuinely needs hands:
   in production (signatures are the contract).
 - **Modern capabilities, fitted to the domain**: a per-intent **playbook**
   (route / nurture) on the SDR researcher; a **super_agent** on the research
-  desk; **instances + an atomic claim** on the backlog-sweeping revival agent;
+  desk; **`scaling.copies` + an atomic claim** on the backlog-sweeping revival agent;
   native **memory** on the two lead-facing agents; a **timezone** on the one live
   cron; a commented **mcp** block for real enrichment.
 - **Sequencing cadences** (the `[0,1,3]`-style day offsets) deliberately do

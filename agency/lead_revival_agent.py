@@ -79,7 +79,7 @@ async def cap_revivals(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
 
 
 def _reshape_instances(result: dict[str, Any]) -> dict[str, Any]:
-    """Under instances_handoff: last the SDK SUMS numbers across the parallel
+    """Under scaling.copies.handoff: last the SDK SUMS numbers across the parallel
     copies — total_revived summing is correct (disjoint batches), but a summed
     confidence_avg is nonsense. Re-derive the weighted mean from the per-copy
     detail on result['_instances'] (present only when >1 copy ran)."""
