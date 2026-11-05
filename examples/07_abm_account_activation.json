@@ -3,7 +3,7 @@
   "entry_point": "register_abm_contact",
   "expected_flow": [
     "abm_orchestrator_agent (register mode) → n8n workflow logs the contact in your CRM's account ledger (Salesforce / HubSpot)",
-    "→ counts contacts from acme-finance.com in 14d window: 3 → THRESHOLD HIT",
+    "→ counts contacts from acme-finance.example in 14d window: 3 → THRESHOLD HIT",
     "→ flips the account to ABM mode in the CRM, picks deterministic AE owner",
     "→ builds multi-stakeholder briefing",
     "→ requires_marketing_air_cover = true",
@@ -13,7 +13,7 @@
     "mode": "register",
     "upstream_yields": {
       "lead_id": "lead-abm-third-contact",
-      "company_domain": "acme-finance.com",
+      "company_domain": "acme-finance.example",
       "tier": "warm",
       "job_title": "VP of Engineering"
     }

@@ -7,9 +7,9 @@
 # human approval, renders the opportunity pack, and commits it -> WORM audit.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off is
-# a finished contract; every human gate default-denies on silence (held ->
-# audit); the finisher produces the real artifact and FAILS CLOSED; the WORM sink
-# is the terminus. Systems (Salesforce / HubSpot / Outreach) are TOOLS behind n8n
+# a finished contract; nothing advances on silence (an unanswered gate closes its
+# Inbox card and the ticket records that no reply came); the finisher produces
+# the real artifact and FAILS CLOSED; the WORM sink is the terminus. Systems (Salesforce / HubSpot / Outreach) are TOOLS behind n8n
 # connectors, never members — their state genuinely lives in your CRM/MAP.
 #
 # A CRO reading this file sees their sales department.
@@ -24,26 +24,18 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 2592000
-
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
   recursive: false
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates stalls
-# / contract violations / repeated errors to the Sales Manager (and pages / posts
-# on SLA breach). It is not a router in the middle of the team.
+# The Manager is the SUPERVISOR — it watches every hand-off and escalates to the
+# Sales Manager when an agent hits an error that a retry cannot fix (auth, bad
+# request, credit, bad config), when 3 different agents fail in one session, or
+# when restarts run out. A contract violation (a hand-off missing its yields)
+# raises an alert, not an escalation. It does NOT chase an unanswered approval
+# and it does NOT watch SLAs — the pipeline sweep (pipeline_health_agent, once
+# its CRM connector is wired) does that. It is not a router in the middle.
 manager:
   model: "gpt-4o-mini"
   domain: "generic"
@@ -57,43 +49,50 @@ manager:
     research; spam -> audit). After the human AE approves, the Deal Desk finisher
     re-checks the approval and commits the opportunity pack.
 
-    Escalate to the Sales Manager when: a hot lead is unrouted within 5 min
-    (SLA), the SDR queue exceeds 100 unworked leads in 24h, a top-tier ICP-A lead
-    has no AE within 30 min, an approval gate times out, or any agent hands off a
-    malformed artifact. Silence never advances a lead.
+    Escalate to the Sales Manager when an agent fails in a way a retry will not
+    fix, or keeps failing. An approval nobody answers is not escalated: the
+    request waits its time and stops, and nothing is sent or committed on
+    silence. SLA and queue-size checks belong to the pipeline sweep
+    (pipeline_health_agent), not to you.
   routing:
     mode: "static"
   escalation:
     targets:
       - type: "human_agent"
         agent: "sales_manager_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{lead_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_SALES_CHANNEL:}"
-        message_template: "[sales] {{message}} — lead {{lead_id}}"
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live, no restart).
+      # - type: "webhook"
+        # connection: escalation_webhook   # vault connection holds the URL + headers
+        # method: "POST"
+        # payload_template:
+          # incident_id: "{{lead_id}}"
+          # severity: "{{severity}}"
+          # message: "{{message}}"
+          # session_id: "{{session_id}}"
+      # Slack escalation: posting needs a Slack adapter, which comes from a
+      # human seat's channels block. Connect Slack on Infrastructure →
+      # Messaging → Slack (vault record, e.g. 'slack_sales'), give
+      # sales_manager_human `channels: {slack: {connection: slack_sales}}`, set
+      # SLACK_SALES_CHANNEL in .env, then uncomment — here before the first
+      # start, in Studio's YAML editor after it. Shipped commented because with
+      # no adapter the target cannot deliver anything.
+      # - type: "channel"
+        # provider: "slack"
+        # channel_id: "${SLACK_SALES_CHANNEL:}"
+        # message_template: "[sales] {{message}} — lead {{lead_id}}"
     auto_escalate:
       max_retries: 2
       max_errors_per_session: 3
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 150
 
 # 2.4.131 runtime block — the ONE non-default this pod genuinely needs: a
 # super-agent research pass over many sources can run long. Everything else
 # stays default (omission is meaningful; we do not pre-fill defaults). The
 # `timeouts` block is REJECTED by <=2.4.130 — it lands with the 2.4.131 floor.
 timeouts:
+  mesh_call_default_timeout_s: 150
   llm_hard_timeout_s: 300
 
 data_structures:
@@ -343,9 +342,9 @@ agents:
       company_tier: "string"
       funding: "object"
       funding_signal: "boolean"
-      tech_stack: "list"
-      high_fit_tech: "list"
-      decision_makers: "list"
+      tech_stack: {type: array, items: string}
+      high_fit_tech: {type: array, items: string}
+      decision_makers: {type: array, items: {type: object, fields: {name: string, title: string}}}
       decision_maker_count: "number"
       enrichment_confidence: "number"
       enrichment_complete: "boolean"
@@ -455,11 +454,11 @@ agents:
       icp_fit: "number"
       intent_score: "number"
       tier: "string"
-      reasons: "list"
+      reasons: {type: array, items: string}
       is_competitor: "boolean"
       sales_briefing: "string"
       opening: "string"
-      cited_signals: "list"
+      cited_signals: {type: array, items: string}
       hook_quality: "number"            # 0..1; <0.5 → SDR human review forced
       lead_id: "string"                 # identity passthrough — SDR/AE sees WHICH lead
     inputs:
@@ -574,36 +573,36 @@ agents:
     # connector wired. Each tool announces available:false when it has no source.
     tools: [get_account_facts, list_decision_makers, list_competitor_overlap]
     tool_categories: [research]
-    # ── To wire real enrichment (ZoomInfo / Clearbit / Explorium), set the URL
-    #    and UNCOMMENT. Each named action under `use:` becomes its own namespaced
-    #    tool (e.g. enrichment_company_facts). NOTE: the SDK rejects an http mcp
-    #    block with an EMPTY url at load, so this ships COMMENTED — fill the URL,
-    #    then uncomment. ──
+    # ── To wire real enrichment (ZoomInfo / Clearbit / Explorium): create the
+    #    vault connection 'enrichment_mcp' on Infrastructure → Integrations →
+    #    MCP (the MCP server's URL + token live there, never here), then
+    #    UNCOMMENT — here before the first start, in Studio's YAML editor after
+    #    it (applies live). Each named action under `use:` becomes its own namespaced
+    #    tool (e.g. enrichment_company_facts). ──
     # mcp:
-    #   - transport: http
-    #     url: "${ENRICHMENT_MCP_URL}"
-    #     token: "${ENRICHMENT_MCP_TOKEN:}"
+    #   - connection: enrichment_mcp   # vault connection holds the URL + token
+    #     transport: http
     #     use: [company_facts, decision_makers, competitor_overlap]
     #     name: enrichment
     #     timeout: 30
     yields:
       mode: "string"                    # intel | dossier
-      competitors_analysed: "list"
-      intel_records: "list"
+      competitors_analysed: {type: array, items: string}
+      intel_records: {type: array, items: object}   # competitor, category, positioning, … (see prompt)
       primary_threat: "string"
       primary_threat_reasoning: "string"
       briefing: "string"
       ae_briefing_appendix: "string"
       requires_pricing_objection_prep: "boolean"
-      kb_curation_needed_for: "list"
+      kb_curation_needed_for: {type: array, items: string}
       account: "string"
       domain: "string"
-      company_facts: "list"
-      decision_makers: "list"
-      recent_signals: "list"
-      competitor_overlap: "list"
-      talking_points: "list"
-      risk_flags: "list"
+      company_facts: {type: array, items: string}
+      decision_makers: {type: array, items: object}   # name, title, email, engagement_signal
+      recent_signals: {type: array, items: {type: object, fields: {kind: string, evidence: string, ts: string}}}
+      competitor_overlap: {type: array, items: string}
+      talking_points: {type: array, items: string}
+      risk_flags: {type: array, items: string}
       dossier_score: "number"
       requires_more_data: "boolean"
       research_briefing: "string"
@@ -630,11 +629,11 @@ agents:
   #     seeds the shared claim queue.
   #   @chain cap_revivals — only signal-backed leads are revivable, capped to
   #     protect the SDR queue; counts recomputed from the capped list.
-  #   @compose — recomputes confidence_avg correctly under the instances merge
+  #   @compose — recomputes confidence_avg correctly under the copies merge
   #     (the SDK SUMS numbers across copies; a mean must be re-derived).
-  # instances: N + an atomic claim tool (claim_cold_leads) fan the backlog out —
+  # scaling.copies.count: N + an atomic claim tool (claim_cold_leads) fan the backlog out —
   # each copy claims a DISJOINT batch, so 3 copies split the sweep instead of
-  # duplicating it. One cron line only (a cron × instances would multiply runs).
+  # duplicating it. One cron line only (a cron × copies would multiply runs).
   # timezone governs the cron (without it "0 10 * * 2" fires in UTC).
   # ─────────────────────────────────────────────────────────────────────────
   lead_revival_agent:
@@ -644,8 +643,11 @@ agents:
     model: "gpt-4o-mini"
     temperature: 0.1
     max_tokens: 1500
-    instances: 3                        # 3 parallel copies per sweep
-    instances_handoff: "last"           # combine + route once (the @compose re-derives the mean)
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3                        # 3 parallel copies per sweep
+        handoff: last           # combine + route once (the @compose re-derives the mean)
     wake_up: "0 10 * * 2"               # Tuesday 10:00 — after pipeline review
     timezone: "Asia/Kolkata"            # governs the cron (UTC otherwise)
     description: "Lead Revival Specialist — weekly sweep; finds cold leads whose context changed (job moves, funding, hiring)."
@@ -661,6 +663,9 @@ agents:
       "just in case" burns SDR trust in the system.
 
       Deterministic rules — apply them exactly:
+        - Each revivable_leads entry is an object: {"lead_id": "", "signal":
+          "<the specific change, e.g. Series-B announced 2026-10-21>",
+          "confidence": 0..1}. An entry with no signal is dropped.
         - Cap revivable_leads at 20 (protect the SDR queue). If more qualify, keep
           the 20 highest-confidence.
         - total_revived = number of entries in revivable_leads (after the cap).
@@ -673,7 +678,7 @@ agents:
     tools: [claim_cold_leads]
     tool_categories: [revival]
     yields:
-      revivable_leads: "list"
+      revivable_leads: {type: array, items: {type: object, fields: {lead_id: string, signal: string, confidence: number}}}
       new_signals_summary: "string"
       total_revived: "number"
       confidence_avg: "number"
@@ -690,7 +695,7 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────────
   # Deal Desk — Opportunity & Outreach Liaison (programmatic FINISHER). Sits
-  # BEHIND the human AE approval gate. It never approves or sends — it re-checks
+  # BEHIND the human AE approval step. It never approves or sends — it re-checks
   # that a human actually approved, recovers the lead across the HITL gap,
   # enforces invariants a human can't waive, renders the opportunity pack, and
   # records an append-only ledger entry. The concrete "@chain fails closed":
@@ -739,8 +744,13 @@ agents:
     communication_type: "chain"
     integration: "n8n"
     description: "Pipeline Health Analyst — SLA/queue sweep, opportunity-stage state from your CRM, idle warnings, per-rep coverage."
-    connector_config:
-      webhook_url: "${N8N_PIPELINE_HEALTH_WEBHOOK_URL:}"
+    # Day 0 the record does not exist yet. Its address + token
+    # live only in the vault: create the vault connection 'pipeline_health_n8n' on
+    # Infrastructure → Integrations → n8n (or an "Add custom" record, service type
+    # Tools — base URL = the workflow's webhook URL), until it exists the
+    # SDK switches this agent off with a notice (it is never called without
+    # an address); it switches on, with no restart, once the record exists.
+    connector_config: {connection: pipeline_health_n8n}
     # wake_up: "0 * * * *"              # enable + add `timezone:` after wiring the CRM connector
     yields:
       breached_leads: "list"
@@ -782,8 +792,13 @@ agents:
     communication_type: "chain"
     integration: "n8n"
     description: "Nurture / Demand-Gen Coordinator — multi-touch nurture for leads not yet AE-ready; graduates on engagement signals."
-    connector_config:
-      webhook_url: "${N8N_NURTURE_WEBHOOK_URL:}"
+    # Day 0 the record does not exist yet. Its address + token
+    # live only in the vault: create the vault connection 'nurture_n8n' on
+    # Infrastructure → Integrations → n8n (or an "Add custom" record, service type
+    # Tools — base URL = the workflow's webhook URL), until it exists the
+    # SDK switches this agent off with a notice (it is never called without
+    # an address); it switches on, with no restart, once the record exists.
+    connector_config: {connection: nurture_n8n}
     # wake_up: "30 8 * * *"             # enable + add `timezone:` after wiring the MAP connector
     yields:
       action: "string"                  # enrolled | sweep | skipped
@@ -831,8 +846,13 @@ agents:
     communication_type: "chain"
     integration: "n8n"
     description: "ABM / Account Coordinator — detects 3+ contacts from one domain → flips the account to coordinated ABM mode."
-    connector_config:
-      webhook_url: "${N8N_ABM_WEBHOOK_URL:}"
+    # Day 0 the record does not exist yet. Its address + token
+    # live only in the vault: create the vault connection 'abm_n8n' on
+    # Infrastructure → Integrations → n8n (or an "Add custom" record, service type
+    # Tools — base URL = the workflow's webhook URL), until it exists the
+    # SDK switches this agent off with a notice (it is never called without
+    # an address); it switches on, with no restart, once the record exists.
+    connector_config: {connection: abm_n8n}
     yields:
       action: "string"                  # registered | coordinate | skipped
       company_domain: "string"
@@ -869,59 +889,59 @@ agents:
     auto_store_yields: true
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Human members — first-class, reached in the channel they already live in.
+  # Human members — first-class, answering in Studio's Inbox.
   # `dual` belongs on the human/webhook boundary agent ONLY; there is NO
-  # human→human wire (dual↔dual auto-bounces replies). Every gate DEFAULT-DENIES
-  # on timeout (fallback → held_for_review → audit); the Manager SUPERVISOR
-  # escalates stalls to the Sales Manager via manager.escalation.targets.
+  # human→human wire (dual↔dual auto-bounces replies). If nobody answers within
+  # a seat's human_timeout_seconds, the request waits no longer: its Inbox card
+  # closes and the ticket records that no reply came. Nothing is sent, approved
+  # or committed on silence, and nobody is chased automatically.
+  # fallback_on_timeout / fallback_response below are the declared intent
+  # (held_for_review → audit); on SDK 2.4.486 a dual seat does not route them.
   # ─────────────────────────────────────────────────────────────────────────
 
   sdr_human:
     name: "sdr_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 1800          # 30 min
-    description: "Sales Development Representative — reviews high-tier / low-hook sequences before send; starts the personalised cadence."
+    description: "Sales Development Representative — reviews warm high-intent and weak-hook sequences before send; the decision is recorded and the cadence runs in your sequencer."
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     yields:
       human_message: "string"
     inputs:
       lead_id: "string"
     can_call:
-      # Whatever the SDR decides (or the held fallback) → record it. The Manager
-      # supervisor escalates a stalled SDR to the Sales Manager (no human→human wire).
+      # Whatever the SDR decides (approve / revise / reject, or the held
+      # fallback) → record it. The approved sequence itself runs in your
+      # sequencer (Outreach / Salesloft), not in this mesh.
       - agent: "sales_audit_logger_agent"
         condition: "always"
 
   ae_human:
     name: "ae_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 3600          # 60 min; reminders/escalation handled by the Manager
+    human_timeout_seconds: 3600          # 60 min — speed-to-lead on a hot inbound
     description: "Account Executive — owns hot leads + opportunity creation; approves the routed lead for commit."
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
       human_message: "string"            # approved | rejected | held_for_review
     inputs:
       lead_pack: "object"
+    human_prompt_template: |
+      A qualified lead is waiting for you: the briefing, scores and the drafted
+      opener are above. Reply with exactly one word:
+        approved  — Deal Desk creates the opportunity and queues the opener
+        rejected  — nothing is created; the decision is recorded
+      Any other reply is recorded and nothing is created.
     can_call:
       # Approved → the Deal Desk finisher commits it. Anything else (rejected /
       # held on timeout) → audit; never a human→human wire.
@@ -933,7 +953,7 @@ agents:
   sales_manager_human:
     name: "sales_manager_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 14400         # 4h
     description: "Sales Manager — accountable owner: escalation endpoint, queue rebalancing, hold-for-review on contested leads."
@@ -941,10 +961,6 @@ agents:
     fallback_response:
       human_decision: "held"
       human_message: "held_for_review"
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
       human_message: "string"
     inputs:
@@ -961,7 +977,7 @@ agents:
     name: "sales_audit_logger_agent"
     agent_type: "external"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     description: "Audit & Compliance Clerk — hash-chains every routing, handoff, approval, and held gate. Terminus."
     connector_config:
       sink_type: "local_file"
