@@ -19,7 +19,7 @@ tier × intent routing matrix.
               briefing + opener; the nurturer gets only the routing keys;
               research gets the competitor signal; audit gets a flat event.
 
-The tier × intent `can_call` matrix in config.yaml reads the floored
+The tier × intent `can_call` matrix in the configuration reads the floored
 `tier` / `is_competitor` / `hook_quality` keys — so routing is governed
 by this Python floor, not by whatever the LLM wishes were true.
 """
