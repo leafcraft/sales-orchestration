@@ -12,7 +12,7 @@
     "competitors": ["salesforce", "hubspot"],
     "upstream_yields": {
       "lead_id": "lead-meeting-prep-001",
-      "company_domain": "globex-saas.com",
+      "company_domain": "globex-saas.example",
       "tier": "hot",
       "pricing_mentioned": true,
       "competitor_overlap": ["salesforce"]
