@@ -3,7 +3,7 @@
 A pod of digital employees + a human sales roster that runs an inbound lead end
 to end — **any-source lead → case opened → normalised & enriched → scored +
 personalised → tier × intent routing → AE/SDR handoff → opportunity committed →
-live status** — with a human on every gate, a finisher that fails closed, and the
+live status** — with a human on every decision, a finisher that fails closed, and the
 systems (Salesforce / HubSpot / Outreach) as tools behind n8n connectors, never
 members.
 
@@ -43,8 +43,7 @@ site's "Book a demo" form. The webhook fires the `demo_request` entry point.
    re-derived by a deterministic floor the LLM cannot inflate.
 4. **`ae_human`** — a real Account Executive — reviews the briefing + opener and
    approves. Nothing is committed without that answer: if nobody answers within
-   60 min, the request waits no longer — its Inbox card closes and the ticket
-   records that no reply came.
+   60 min, the seat's default reply, `hold`, is recorded in the audit log.
 5. **Deal Desk** (`deal_desk_agent`, the FINISHER) re-checks that a human
    actually approved (allow/deny tokens, **unknown fails closed**), recovers the
    lead across the HITL gap, enforces invariants (a committable tier, a lead on
@@ -75,10 +74,16 @@ closes those gaps the only honest way:
 - **The finisher fails closed.** Reaching Deal Desk does not mean approved — it
   re-checks the human verdict against an allow/deny list, treats an **unknown
   verdict as a block**, and deletes a half-rendered pack if an invariant trips.
-- **Silence never advances a lead.** If nobody answers a gate within its time,
-  the request waits no longer: its Inbox card closes and the ticket records that
-  no reply came. Nothing is sent, approved or committed on silence, and nobody
-  is chased automatically — the Sales Manager sees the closed card in the Inbox.
+- **Replies are typed, then read.** The Inbox has no buttons. The person types a
+  reply and a small reply reader (`gpt-4o-mini`) turns it into a `verdict`
+  (`approve` or `hold` for the AE; `hold` for the SDR and Sales Manager).
+  Anything that is not a clear yes reads as `hold`. If the person answered an
+  agent's question instead, the verdict is `answer` and it goes back to only
+  the agent that asked.
+- **Silence never advances a lead.** If nobody answers within its time,
+  the seat's default reply (`hold`) goes through its routes like any reply and
+  is recorded in the audit log. Nothing is sent, approved or committed on
+  silence, and nobody is chased automatically.
 - **State lives in your systems.** Pipeline, nurture, and the account ledger live
   in your CRM/MAP behind n8n connectors — no template SQLite pretending to be a
   system of record.
@@ -99,7 +104,7 @@ Tiers 2–3.
 ### Tier 1 — required to boot (dev mode)
 | Setting | For | Notes |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `OPENAI_API_KEY` | Sol + intake + revival + Manager (`gpt-4o-mini`) | **Required.** |
 | `ANTHROPIC_API_KEY` | qualification + research (`claude-sonnet-4-6`) | **Required.** |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults `localhost:6379`. Bring your own Redis, or let `create-leafmesh --start .` start one. |
@@ -140,18 +145,18 @@ only always-on cron is `lead_revival_agent` (Tue 10:00 `Asia/Kolkata`).
 
 | Agent | Role (human job title) | Responsibilities | Can perform |
 |---|---|---|---|
-| `sales_coordinator_agent` | Lead Desk Coordinator | Opens the lead case, orchestrates the pod, keeps live status, single point of contact | LLM (gpt-4o-mini); → intake (open_case), Sales Manager (escalate); **never scores or approves** |
-| `lead_intake_agent` | Lead Intake & Enrichment Researcher | Normalise any-source lead → canonical `Lead` (freemail guard, domain derivation); enrich firmographics, funding, tech stack, decision makers | LLM + **cross-session memory**; `@pre_compose` account-history pull; `@chain` tier floor + idempotent upsert; `@compose` ABM register |
+| `sales_coordinator_agent` | Lead Desk Coordinator | Opens the lead case, orchestrates the pod, keeps live status, single point of contact | LLM (gpt-4o-mini) + **playbook** (open_case / answer_status / escalate); → intake (open_case), Sales Manager (escalate); **never scores or approves** |
+| `lead_intake_agent` | Lead Intake & Enrichment Researcher | Normalise any-source lead → canonical `Lead` (freemail guard, domain derivation); enrich firmographics, funding, tech stack, decision makers | LLM + **playbook** (normalise_lead / enrich_company) + **cross-session memory**; `@pre_compose` account-history pull; `@chain` tier floor + idempotent upsert; `@compose` ABM register |
 | `lead_qualification_agent` | SDR Researcher (Scoring & Personalisation) | Score ICP fit + intent → `tier`; draft a signal-cited opener in the same pass; route on the tier × intent matrix | LLM + **playbook** (route / nurture) + **memory**; `@chain` score/tier/hook/competitor/spam floors; `@compose` per-downstream; stashes for the finisher |
-| `sales_research_agent` | Sales Research Desk | Mode-dispatched: competitor intel pack (`intel`) or pre-meeting account dossier (`dossier`); score completeness; flag KB gaps | LLM + **super_agent** (autonomous plan/execute/verify) + dev-store tools; `@chain` dossier-score floor + bounded research↔qualification loop |
-| `lead_revival_agent` | Lead Revival Specialist | Weekly sweep of 90-day-cold leads for fresh intent (job moves, funding, hiring); cap revivals at 20 | LLM + **`scaling.copies.count: 3`** + **atomic claim tool** + **timezone** cron; `@chain` 20-cap floor; `@compose` re-derives the mean under the merge |
+| `sales_research_agent` | Sales Research Desk | Mode-dispatched: competitor intel pack (`intel`) or pre-meeting account dossier (`dossier`); score completeness; flag KB gaps | LLM + **playbook** (competitor_intel / account_dossier) + **super_agent** (autonomous plan/execute/verify) + dev-store tools; `@chain` dossier-score floor + bounded research↔qualification loop |
+| `lead_revival_agent` | Lead Revival Specialist | Weekly sweep of 90-day-cold leads for fresh intent (job moves, funding, hiring); cap revivals at 20 | LLM + **playbook** (claim_and_check / select_revivals) + **`scaling.copies.count: 3`** + **atomic claim tool** + **timezone** cron; `@chain` 20-cap floor; `@compose` re-derives the mean under the merge |
 | `deal_desk_agent` | Opportunity & Outreach Liaison | Re-check the AE approval, commit the opportunity, queue the approved outreach, ledger it | Programmatic **FINISHER**; approve-token re-check → invariants → render pack → **delete-on-block** → WORM ledger |
 | `pipeline_health_agent` | Pipeline Health Analyst | SLA/queue sweep; opportunity-stage state from your CRM; idle warnings; per-rep coverage | Programmatic (n8n); → Sales Manager (escalate) |
 | `deal_nurturer_agent` | Nurture / Demand-Gen Coordinator | Enrol mid-funnel leads into MAP drip sequences; graduate on engagement ≥ 0.70 | Programmatic (n8n); → AE (graduated) → the finisher |
 | `abm_orchestrator_agent` | ABM / Account Coordinator | Register contacts; flip to coordinated ABM at 3+ contacts / 14d; assign one AE; dedup touches | Programmatic (n8n); → AE (activation), audit |
-| `ae_human` | Account Executive (Human) | Owns hot leads; approves the routed lead for commit | Human gate (60 min; nothing committed without "approved"); → the finisher on approval, anything else → audit |
-| `sdr_human` | Sales Development Representative (Human) | Reviews warm high-intent and weak-hook sequences before send | Human gate (30 min); the decision is recorded → audit; the cadence runs in your sequencer |
-| `sales_manager_human` | Sales Manager (Human) | Accountable owner — escalations, blocked commits, queue rebalancing | Human gate (4 h); the Manager's escalation target; gets every blocked Deal Desk commit |
+| `ae_human` | Account Executive (Human) | Owns hot leads; approves the routed lead for commit | Human step (60 min; nothing committed without the verdict `approve`); → the finisher on `approve`, `hold` → audit |
+| `sdr_human` | Sales Development Representative (Human) | Reviews warm high-intent and weak-hook sequences before send | Human step (30 min); the decision is recorded → audit; the cadence runs in your sequencer |
+| `sales_manager_human` | Sales Manager (Human) | Accountable owner — escalations, blocked commits, queue rebalancing | Human step (4 h); the Manager's escalation target; gets every blocked Deal Desk commit |
 | `sales_audit_logger_agent` | Audit & Compliance Clerk | Hash-chains every routing, handoff, approval, and held gate | External (custom sink); terminus |
 
 The **LeafMesh Manager** supervises. It escalates to the Sales Manager (Inbox;

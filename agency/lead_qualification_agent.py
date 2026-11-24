@@ -134,7 +134,7 @@ async def enforce_qualification_floors(result: dict[str, Any], ctx: Any) -> dict
         store.record_qualification(lead_id, result["tier"], icp, intent,
                                    routed_to="(matrix)")
         # Stash the lead context by session so the Deal Desk FINISHER can recover
-        # it across the AE human gate (the SDK re-delivers only the human-reply
+        # it across the AE human step (the SDK re-delivers only the human-reply
         # meta fields — the qualification payload is not re-delivered downstream).
         session_stash.stash_put(util.sid(result, ctx), {
             "lead_id": lead_id,

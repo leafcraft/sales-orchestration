@@ -12,7 +12,7 @@ an append-only ledger entry. It is the concrete "@chain fails closed":
      record).
   c) render the real pack to ./out; on a tripped floor, DELETE the partial and
      record status: blocked with reasons — never a half-committed opportunity.
-  d) dev-store recovery — after the HITL gate the upstream payload is dropped, so
+  d) dev-store recovery — after the human step the upstream payload is dropped, so
      it recovers the lead from the session stash / dev store.
 
 Called AFTER the human AE approves (qualification already did the routing), so
@@ -50,7 +50,7 @@ def _signal(input_data: dict) -> str:
     if isinstance(up, dict):
         sources.extend(v for v in up.values() if isinstance(v, dict))
     for src in sources:
-        for key in ("human_message", "human_decision", "decision", "message"):
+        for key in ("verdict", "human_message", "human_decision", "decision", "message"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()

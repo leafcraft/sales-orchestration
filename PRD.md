@@ -42,8 +42,8 @@ ingress (webform / demo / event / partner / manual) ─► sales_coordinator_age
  lead_revival_agent (cron Tue 10:00, copies.count:3 + atomic claim) ──revived──► sdr_human
  pipeline_health_agent (cron off) ──escalate──► sales_manager_human
 
- nothing advances on silence: an unanswered gate closes its Inbox card and the
- ticket records that no reply came. The Manager SUPERVISOR escalates repeated /
+ nothing advances on silence: an unanswered gate's default reply (hold) goes
+ to sales_audit_logger_agent. The Manager SUPERVISOR escalates repeated /
  unfixable agent errors to sales_manager_human via manager.escalation.
  sales_audit_logger_agent = hash-chained WORM terminus on every branch.
 ```
@@ -118,12 +118,13 @@ See the agency's configuration (in Studio) for the authoritative spec. Summary:
 - **pipeline_health_agent / deal_nurturer_agent / abm_orchestrator_agent**
   (programmatic, n8n) — connector-only; CRM/MAP owns pipeline / nurture /
   account-ledger state. No template Python.
-- **ae_human / sdr_human / sales_manager_human** (human gates, 60 min / 30 min /
-  4 h). Only an explicit "approved" from the AE reaches the finisher. If nobody
-  answers in time, the request waits no longer: its Inbox card closes and the
-  ticket records that no reply came — nothing is committed. The declared
-  fallback (`held_for_review` → audit) is kept in config; on SDK 2.4.486 a dual
-  seat does not route it. No human→human wire (dual↔dual is a footgun).
+- **ae_human / sdr_human / sales_manager_human** (human steps, 60 min / 30 min /
+  4 h). Each is `chain` with a `reply_reader` (`gpt-4o-mini`) that turns the
+  typed reply into a `verdict`. Only the verdict `approve` from the AE reaches
+  the finisher; `hold` goes to audit; `answer` goes back to only the agent that
+  asked. If nobody answers in time, the seat's `fallback_response`
+  (`verdict: hold`, `held_for_review`) goes through its routes like any reply
+  and lands in audit — nothing is committed. No human→human wire.
 - **sales_audit_logger_agent** (external custom) — hash-chained WORM, executed
   via `mesh.intelligence()` from `agency/_shared/audit_logger.py`.
 
@@ -141,8 +142,8 @@ qualification.
 
 ## 7. Controls & trust
 
-- **Nothing advances on silence** — an unanswered gate closes its Inbox card and
-  the ticket records that no reply came; nobody is chased automatically. The
+- **Nothing advances on silence** — an unanswered question to a person's default reply (`hold`)
+  is recorded in the audit log; nobody is chased automatically. The
   Manager escalates only agent errors (unfixable, or 3 failed agents in one
   session) to the Sales Manager.
 - **The tier is earned, not claimed** — the tier × intent matrix reads the keys
